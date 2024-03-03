@@ -1,2 +1,4 @@
 hardware/*-backups/*.zip
 hardware/*-bak
+hardware/*.lck
+hardware/#auto_saved_files#
