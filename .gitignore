@@ -1,5 +1,6 @@
 hardware/*-backups/*.zip
 hardware/*-bak
+hardware/*.bak
 hardware/*.lck
 hardware/#auto_saved_files#
 software/.idea

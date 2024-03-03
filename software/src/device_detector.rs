@@ -41,3 +41,11 @@ pub fn safe_detect_device(settings: &DeviceSettings) -> Result<Device> {
 
     Err(anyhow!("No devices connected"))
 }
+
+pub fn detect_device(settings: &DeviceDetectorSettings) -> Result<Device> {
+    if let Some(known_port_name) = settings.port.as_ref() {
+        create_and_check_device(known_port_name.as_str(), &settings.device_settings)
+    } else {
+        safe_detect_device(&settings.device_settings)
+    }
+}

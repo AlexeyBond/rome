@@ -1,13 +1,13 @@
-use std::io::{BufReader, ErrorKind, Read, Write};
-use std::time::Duration;
-use anyhow::{anyhow, Context, Result};
+use std::io::{ErrorKind, Read, Write};
+use std::time::{Duration, Instant};
+use anyhow::{anyhow, Context, Error, Result};
 use clap::Args;
 use serialport::SerialPort;
 
 #[derive(Copy, Clone, Args)]
 pub struct DeviceSettings {
     /// Port baud rate
-    #[arg(long, default_value_t = 2_000_000)]
+    #[arg(long, default_value_t = 250_000)]
     pub baud_rate: u32,
 
     /// Default read timeout
@@ -27,7 +27,15 @@ pub struct Device {
     name: String,
     settings: DeviceSettings,
     default_timeout_applied: bool,
-    port: BufReader<Box<dyn SerialPort>>,
+    port: Box<dyn SerialPort>,
+}
+
+fn is_timeout(err: &Error) -> bool {
+    if let Some(io_error) = err.root_cause().downcast_ref::<std::io::Error>() {
+        return io_error.kind() == ErrorKind::TimedOut;
+    }
+
+    return false;
 }
 
 impl Device {
@@ -41,7 +49,7 @@ impl Device {
             name: port_name.to_string(),
             settings: settings.clone(),
             default_timeout_applied: false,
-            port: BufReader::new(port),
+            port,
         })
     }
 
@@ -50,9 +58,9 @@ impl Device {
     }
 
     pub fn send(&mut self, command: &[u8]) -> Result<()> {
-        self.port.get_mut().write(command)
+        self.port.write(command)
             .context("Error sending command")?;
-        self.port.get_mut().flush()?;
+        self.port.flush()?;
 
         Ok(())
     }
@@ -68,7 +76,7 @@ impl Device {
                     return Err(anyhow!("Response size exceeds limit of {} bytes", limit));
                 }
 
-                let sz = self.port.get_mut().read(&mut buf)?;
+                let sz = self.port.read(&mut buf)?;
                 if sz != 0 {
                     if buf[0] == b'\n' {
                         break;
@@ -78,7 +86,7 @@ impl Device {
                 }
 
                 if !self.default_timeout_applied {
-                    self.port.get_mut().set_timeout(self.settings.read_timeout)?;
+                    self.port.set_timeout(self.settings.read_timeout)?;
                 }
             }
 
@@ -103,20 +111,26 @@ impl Device {
         }
     }
 
+    pub fn receive_with_timeout(&mut self, limit: usize, timeout: Duration) -> Result<Vec<u8>> {
+        let end_time = Instant::now() + timeout;
+
+        loop {
+            match self.receive(limit) {
+                Err(e) if is_timeout(&e) && Instant::now() < end_time => {},
+                res => { return res; }
+            }
+        }
+    }
+
     pub fn check(&mut self) -> Result<()> {
         self.send(b"V\n")?;
         let response = match self.receive(24) {
-            Ok(r) => r,
-            Err(e) => match e.downcast_ref::<std::io::Error>() {
-                Some(err) if err.kind() == ErrorKind::TimedOut => {
-                    eprintln!("Got timeout, re-sending 'V' command...");
-                    self.send(b"V\n")?;
-                    self.receive(24)?
-                },
-                _ => {
-                    return Err(e);
-                }
-            }
+            Err(e) if is_timeout(&e) => {
+                eprintln!("Got timeout, re-sending 'V' command...");
+                self.send(b"V\n")?;
+                self.receive(24)?
+            },
+            res => res?,
         };
 
         if !response.starts_with(b"VROME") {
