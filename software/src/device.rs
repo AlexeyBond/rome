@@ -1,5 +1,5 @@
 use std::io::{ErrorKind, Read, Write};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Error, Result};
 use clap::Args;
 use serialport::SerialPort;
@@ -18,9 +18,16 @@ pub struct DeviceSettings {
     #[arg(long, value_parser = humantime::parse_duration, default_value = "2s")]
     pub initial_read_timeout: Duration,
 
-    /// Show debug messages received from device
+    /// Show info (starting with #) messages received from device
     #[arg(long, default_value_t = false)]
-    pub show_debug_messages: bool,
+    pub show_info_messages: bool,
+
+    /// Show all messages exchange between this program and the device
+    #[arg(long)]
+    pub show_all_messages: bool,
+
+    #[arg(long, value_parser = humantime::parse_duration, default_value = "2s")]
+    pub sync_timeout: Duration,
 }
 
 pub struct Device {
@@ -58,6 +65,10 @@ impl Device {
     }
 
     pub fn send(&mut self, command: &[u8]) -> Result<()> {
+        if self.settings.show_all_messages {
+            eprintln!("sending: {}", String::from_utf8_lossy(command).trim_end());
+        }
+
         self.port.write(command)
             .context("Error sending command")?;
         self.port.flush()?;
@@ -65,37 +76,44 @@ impl Device {
         Ok(())
     }
 
+    fn show_inbound_message(&self, msg: &[u8]) {
+        if self.settings.show_all_messages || (self.settings.show_info_messages && matches!(msg.first(), Some(c) if *c == b'#')) {
+            eprintln!("received: {}", String::from_utf8_lossy(msg));
+        }
+    }
+
+    fn receive_line_raw(&mut self, buffer: &mut Vec<u8>, limit: usize) -> Result<()> {
+        let mut b: [u8; 1] = [0; 1];
+
+        loop {
+            if buffer.len() > limit {
+                return Err(anyhow!("Response size exceeds limit of {} bytes", limit));
+            }
+
+            if self.port.read(&mut b)? != 0 {
+                if b[0] == b'\n' {
+                    self.show_inbound_message(buffer.as_slice());
+                    return Ok(());
+                } else {
+                    buffer.push(b[0]);
+                }
+            }
+
+            if !self.default_timeout_applied {
+                self.port.set_timeout(self.settings.read_timeout)?;
+            }
+        }
+    }
+
     pub fn receive(&mut self, limit: usize) -> Result<Vec<u8>> {
         let mut line = vec![];
 
         loop {
-            let mut buf: [u8; 1] = [0; 1];
-
-            loop {
-                if buf.len() > limit {
-                    return Err(anyhow!("Response size exceeds limit of {} bytes", limit));
-                }
-
-                let sz = self.port.read(&mut buf)?;
-                if sz != 0 {
-                    if buf[0] == b'\n' {
-                        break;
-                    } else {
-                        line.push(buf[0]);
-                    }
-                }
-
-                if !self.default_timeout_applied {
-                    self.port.set_timeout(self.settings.read_timeout)?;
-                }
-            }
+            self.receive_line_raw(&mut line, limit)?;
 
             match line.first().cloned() {
                 None => { continue; }
                 Some(b'#') => {
-                    if self.settings.show_debug_messages {
-                        eprintln!("debug -> {}", String::from_utf8_lossy(line.as_slice()));
-                    }
                     line.clear();
                 }
                 Some(b'!') => {
@@ -122,17 +140,44 @@ impl Device {
         }
     }
 
+    fn sync(&mut self) -> Result<()> {
+        let message = format!("P{}\n", SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros());
+        self.send(message.as_bytes())?;
+
+        let sync_deadline = SystemTime::now() + self.settings.sync_timeout;
+
+        let mut receive_buffer = vec![];
+
+        let expected_payload = &message.trim().as_bytes()[1..];
+
+        loop {
+            self.receive_line_raw(&mut receive_buffer, 64)?;
+
+            if matches!(receive_buffer.first(), Some(c) if *c == b'p') {
+                if &receive_buffer[1..] == expected_payload {
+                    return Ok(());
+                }
+            }
+
+            if SystemTime::now() > sync_deadline {
+                return Err(anyhow!("Sync timeout exceeded"));
+            }
+
+            receive_buffer.clear();
+        }
+    }
+
     pub fn check(&mut self) -> Result<()> {
-        self.send(b"V\n")?;
-        let response = match self.receive(24) {
-            Err(e) if is_timeout(&e) => {
-                eprintln!("Got timeout, re-sending 'V' command...");
-                self.send(b"V\n")?;
-                self.receive(24)?
-            },
-            res => res?,
+        if let Err(e) = self.sync() {
+            if is_timeout(&e) {
+                eprintln!("Got timeout, trying to synchronize again...");
+                self.sync()
+                    .context("Error synchronizing with device - it did not respond correctly to ping message")?;
+            }
         };
 
+        self.send(b"V\n")?;
+        let response = self.receive(24)?;
         if !response.starts_with(b"VROME") {
             return Err(anyhow!(
                 "Unexpected response for 'V' command: {}",
@@ -141,5 +186,10 @@ impl Device {
         }
 
         Ok(())
+    }
+
+    pub fn memory_size(&mut self) -> Result<usize> {
+        // TODO: Support devices with 32KiB (24257) memory (?)
+        Ok(0x10000)
     }
 }

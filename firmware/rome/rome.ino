@@ -163,6 +163,18 @@ namespace command_input {
     res = x;
   }
 
+  inline void peek_char(uint8_t& res) {
+    while (!Serial.available()) ;
+
+    int x = Serial.peek();
+
+    if (x < 0) {
+      exit(1);
+    }
+
+    res = x;
+  }
+
   inline void skip_line() {
     uint8_t ch;
     do {
@@ -179,10 +191,15 @@ namespace command_input {
       return 0;
     }
 
-    uint8_t b = res - 'A';
+    a = res - 'A';
+    if (a < 6) {
+      res = 10 + a;
+      return 0;
+    }
 
-    if (b < 6) {
-      res = 10 + b;
+    a = res - 'a';
+    if (a < 6) {
+      res = 10 + a;
       return 0;
     }
 
@@ -274,25 +291,18 @@ inline void run_write_bytes(uint16_t start_address) {
 
   uint16_t current_address = start_address;
   while (true) {
-    uint8_t delimiter;
-    command_input::read_char(delimiter);
-    switch (delimiter) {
-    case ' ':
-      break;
-    case '\n':
+    uint8_t next_char;
+    command_input::peek_char(next_char);
+
+    if (next_char == '\n') {
+      command_input::read_char(next_char);
       Serial.write("W");
       print_hex(start_address);
-      Serial.write(' ');
       print_hex(current_address);
       Serial.write('\n');
       return;
-    default:
-      Serial.write("!BADSYNTAX DATA ");
-      Serial.write(delimiter);
-      Serial.write("\n");
-      command_input::skip_line();
-      return;
     }
+
     uint8_t byte;
     if (command_input::read_hex_byte(byte) < 0) {
       Serial.write("!BADARG DATA ");
@@ -361,7 +371,6 @@ void loop() {
       Serial.write('R');
       state::ensure_state(state::Reading);
       while (size--) {
-        Serial.write(' ');
         uint8_t data = read_address(address);
 
         print_hex(data);
@@ -370,6 +379,7 @@ void loop() {
       Serial.write('\n');
       break;
     case 'E': // E - enable external access
+      command_input::skip_line();
       state::ensure_state(state::ExternalControl);
       Serial.write("EOK\n");
       break;
@@ -380,6 +390,14 @@ void loop() {
     case 'V': // V - show version
       Serial.write("VROME-0.0.1a\n");
       command_input::skip_line();
+      break;
+    case 'P': // P - ping
+      Serial.write('p');
+      do {
+        command_input::read_char(cmd);
+        Serial.write(cmd);
+      } while (cmd != '\n');
+    case '\n':
       break;
     default:
       Serial.write("!BADCMD ");
