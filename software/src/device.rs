@@ -10,13 +10,16 @@ pub struct DeviceSettings {
     #[arg(long, default_value_t = 250_000)]
     pub baud_rate: u32,
 
-    /// Default read timeout
+    /// Default I/O operations timeout
     #[arg(long, value_parser = humantime::parse_duration, default_value = "1s")]
-    pub read_timeout: Duration,
+    pub timeout: Duration,
 
-    /// Read timeout for first read operation
+    /// Read timeout for first I/O operation.
+    ///
+    /// For some reason, first operation after connecting the device may take more time than normal,
+    /// at least on windows.
     #[arg(long, value_parser = humantime::parse_duration, default_value = "2s")]
-    pub initial_read_timeout: Duration,
+    pub initial_timeout: Duration,
 
     /// Show info (starting with #) messages received from device
     #[arg(long, default_value_t = false)]
@@ -26,6 +29,7 @@ pub struct DeviceSettings {
     #[arg(long)]
     pub show_all_messages: bool,
 
+    /// Timeout for stream synchronization operation
     #[arg(long, value_parser = humantime::parse_duration, default_value = "2s")]
     pub sync_timeout: Duration,
 }
@@ -48,7 +52,7 @@ fn is_timeout(err: &Error) -> bool {
 impl Device {
     pub fn new(port_name: &str, settings: &DeviceSettings) -> Result<Self> {
         let port = serialport::new(port_name, settings.baud_rate)
-            .timeout(settings.initial_read_timeout)
+            .timeout(settings.initial_timeout)
             .open()
             .context("Error opening port")?;
 
@@ -100,7 +104,7 @@ impl Device {
             }
 
             if !self.default_timeout_applied {
-                self.port.set_timeout(self.settings.read_timeout)?;
+                self.port.set_timeout(self.settings.timeout)?;
             }
         }
     }
@@ -141,7 +145,7 @@ impl Device {
     }
 
     fn sync(&mut self) -> Result<()> {
-        let message = format!("P{}\n", SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros());
+        let message = format!("\nP{}\n", SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros());
         self.send(message.as_bytes())?;
 
         let sync_deadline = SystemTime::now() + self.settings.sync_timeout;

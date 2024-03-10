@@ -3,17 +3,17 @@ mod device_detector;
 mod data_ops;
 mod file_io;
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::{NonZeroU8, NonZeroUsize};
 use std::path::PathBuf;
 use std::process::exit;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use crate::data_ops::{DataReadRequest, DEFAULT_READ_BUFFER_SIZE, read_data};
+use crate::data_ops::{DataChunk, DataReadRequest, DataWriteRequest, read_data, write_data};
 use crate::device::DeviceSettings;
 use crate::device_detector::DeviceDetectorSettings;
-use crate::file_io::open_output_stream;
+use crate::file_io::{open_input_stream, open_output_stream};
 
 #[derive(Parser)]
 struct TheArgs {
@@ -70,23 +70,55 @@ enum DataCommand {
     /// Read data from device
     Read {
         /// Address of the first byte to read.
-        #[arg(long)]
-        offset: Option<u16>,
+        #[arg(long, default_value_t = 0u16)]
+        offset: u16,
 
         /// Number of bytes to read from device memory.
+        ///
+        /// By default, all data from --offset to the end of device address space will be read.
         #[arg(long)]
         size: Option<usize>,
 
         /// Size of read buffer.
-        #[arg(long)]
-        buffer_size: Option<u8>,
+        #[arg(long, default_value_t = crate::data_ops::DEFAULT_READ_BUFFER_SIZE)]
+        buffer_size: u8,
 
         /// A file to write the data to.
+        ///
         /// If not defined, the result will be printed to standard output.
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    Write {},
+    /// Write data to device
+    Write {
+        /// Address of first byte to write.
+        #[arg(long, default_value_t = 0u16)]
+        offset: u16,
+
+        /// Size of buffer used during write operation.
+        ///
+        /// Defaults to a value safe to use with Arduino's default serial receive buffer size.
+        #[arg(long, default_value_t = crate::data_ops::DEFAULT_WRITE_BUFFER_SIZE)]
+        buffer_size: u8,
+
+        /// Path to input file.
+        ///
+        /// If not specified, the standard input will be used.
+        #[arg(long)]
+        input: Option<PathBuf>,
+
+        /// Verify written data after writing.
+        ///
+        /// If set, the program will read all written data back from the device and compare it with
+        /// the data that should have been written.
+        /// If the data received from device differs, the program will exit with a non-zero code.
+        #[arg(long)]
+        verify: bool,
+
+        /// Size of buffer used for read operations during write result validation.
+        #[arg(long, default_value_t = crate::data_ops::DEFAULT_READ_BUFFER_SIZE)]
+        verification_read_buffer_size: u8,
+    },
 }
 
 fn main() -> Result<()> {
@@ -144,7 +176,6 @@ fn main() -> Result<()> {
             match command {
                 DataCommand::Read { offset, size, output, buffer_size } => {
                     let mut stream = open_output_stream(output)?;
-                    let offset = offset.unwrap_or(0u16);
                     let size = match size {
                         None => {
                             let device_size = device.memory_size()?;
@@ -158,7 +189,7 @@ fn main() -> Result<()> {
                         }
                         Some(nzsz) => nzsz
                     };
-                    let buffer_size = match NonZeroU8::new(buffer_size.unwrap_or(DEFAULT_READ_BUFFER_SIZE)) {
+                    let buffer_size = match NonZeroU8::new(buffer_size) {
                         Some(nz_bsz) => nz_bsz,
                         None => {
                             return Err(anyhow!("Illegal buffer size"));
@@ -172,11 +203,78 @@ fn main() -> Result<()> {
                     })? {
                         let chunk = chunk_result?;
 
-                        stream.write(chunk.as_slice())?;
+                        stream.write(chunk.data.as_slice())?;
                     }
                 }
-                DataCommand::Write { .. } => {
-                    todo!()
+                DataCommand::Write {
+                    input,
+                    offset,
+                    buffer_size,
+                    verify,
+                    verification_read_buffer_size,
+                } => {
+                    let buffer_size = match NonZeroU8::new(buffer_size) {
+                        None => {
+                            return Err(anyhow!("Illegal buffer size"));
+                        },
+                        Some(bsz) => bsz,
+                    };
+                    let verification_read_buffer_size = match NonZeroU8::new(verification_read_buffer_size) {
+                        None => {
+                            return Err(anyhow!("Illegal verification buffer size"));
+                        },
+                        Some(bsz) => bsz,
+                    };
+
+                    let mut data = vec![];
+                    open_input_stream(input)?.read_to_end(&mut data)?;
+
+                    if data.is_empty() {
+                        eprintln!("Empty input data file or stream provided. Exiting without writing anything.");
+                        return Ok(());
+                    }
+
+                    if (offset as usize) + data.len() > device.memory_size()? {
+                        return Err(anyhow!(
+                            "Data file size is too large: 0x{:X} bytes of data supplied at offset 0x{:04X}. Total device memory size is 0x{:X}",
+                            data.len(),
+                            offset,
+                            device.memory_size()?,
+                        ))
+                    }
+
+                    write_data(&mut device, DataWriteRequest {
+                        data: &DataChunk {
+                            data: data.as_slice(),
+                            offset,
+                        },
+                        buffer_size
+                    })?;
+
+                    if verify {
+                        eprintln!("Verifying written data...");
+
+                        for read_chunk in read_data(
+                            &mut device,
+                            DataReadRequest {
+                                offset,
+                                size: NonZeroUsize::new(data.len()).unwrap(),
+                                buffer_size: verification_read_buffer_size,
+                            }
+                        )? {
+                            let read_chunk = read_chunk?;
+                            let chunk_offset = offset.wrapping_add(read_chunk.offset);
+                            let required_data = &data.as_slice()[(chunk_offset as usize)..(chunk_offset as usize + read_chunk.data.len())];
+
+                            if read_chunk.data.as_slice() != required_data {
+                                return Err(anyhow!(
+                                    "Verification failed in range {:04X}:{:04X}",
+                                    chunk_offset,
+                                    chunk_offset as usize + read_chunk.data.len(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }

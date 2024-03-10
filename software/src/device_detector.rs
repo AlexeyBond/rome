@@ -5,7 +5,11 @@ use crate::device::{Device, DeviceSettings};
 
 #[derive(Clone, Args)]
 pub struct DeviceDetectorSettings {
-    /// Name of known device port to use
+    /// Name of known device port to use.
+    /// If not specified, the program will try to detect the device automatically.
+    ///
+    /// Note: automatic detection may in some cases damage some other devices connected to the
+    /// computer as the program will try to send messages to devices that look like ROME.
     #[arg(long, short)]
     port: Option<String>,
 
