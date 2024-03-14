@@ -9,9 +9,9 @@ use std::path::PathBuf;
 use std::process::exit;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use crate::data_ops::{DataChunk, DataReadRequest, DataWriteRequest, read_data, write_data};
-use crate::device::DeviceSettings;
+use crate::device::{Device, DeviceSettings};
 use crate::device_detector::DeviceDetectorSettings;
 use crate::file_io::{open_input_stream, open_output_stream};
 
@@ -62,6 +62,13 @@ enum DeviceCommand {
         /// Maximal duration of device test. It usually takes about 3 seconds.
         #[arg(long, value_parser = humantime::parse_duration, default_value = "10s")]
         test_timeout: Duration,
+
+        #[command(flatten)]
+        external_control_settings: ExternalControlSettings,
+    },
+    EnableExternalControl {
+        #[command(flatten)]
+        detector_settings: DeviceDetectorSettings,
     },
 }
 
@@ -88,6 +95,9 @@ enum DataCommand {
         /// If not defined, the result will be printed to standard output.
         #[arg(long)]
         output: Option<PathBuf>,
+
+        #[command(flatten)]
+        external_control_settings: ExternalControlSettings,
     },
     /// Write data to device
     Write {
@@ -118,7 +128,27 @@ enum DataCommand {
         /// Size of buffer used for read operations during write result validation.
         #[arg(long, default_value_t = crate::data_ops::DEFAULT_READ_BUFFER_SIZE)]
         verification_read_buffer_size: u8,
+
+        #[command(flatten)]
+        external_control_settings: ExternalControlSettings,
     },
+}
+
+#[derive(Args)]
+struct ExternalControlSettings {
+    /// Do not switch to external control after operation completion.
+    #[arg(long)]
+    no_external_control: bool,
+}
+
+impl ExternalControlSettings {
+    fn apply(&self, device: &mut Device) -> Result<()> {
+        if !self.no_external_control {
+            device.enable_external_control()?;
+        }
+
+        Ok(())
+    }
 }
 
 fn main() -> Result<()> {
@@ -153,7 +183,11 @@ fn main() -> Result<()> {
 
             println!("{}", String::from_utf8_lossy(&response.as_slice()[1..]));
         }
-        Command::Device(DeviceCommand::Test { test_timeout, detector_settings }) => {
+        Command::Device(DeviceCommand::Test {
+                            test_timeout,
+                            detector_settings,
+                            external_control_settings,
+                        }) => {
             let mut device = device_detector::detect_device(&detector_settings)?;
             device.send(b"T\n")?;
             match device.receive_with_timeout(128, test_timeout)?.as_slice() {
@@ -169,12 +203,23 @@ fn main() -> Result<()> {
                     exit(1);
                 }
             }
+
+            external_control_settings.apply(&mut device)?;
+        }
+        Command::Device(DeviceCommand::EnableExternalControl { detector_settings }) => {
+            device_detector::detect_device(&detector_settings)?.enable_external_control()?;
         }
         Command::Data { detector_settings, command } => {
             let mut device = device_detector::detect_device(&detector_settings)?;
 
             match command {
-                DataCommand::Read { offset, size, output, buffer_size } => {
+                DataCommand::Read {
+                    offset,
+                    size,
+                    output,
+                    buffer_size,
+                    external_control_settings,
+                } => {
                     let mut stream = open_output_stream(output)?;
                     let size = match size {
                         None => {
@@ -205,6 +250,8 @@ fn main() -> Result<()> {
 
                         stream.write(chunk.data.as_slice())?;
                     }
+
+                    external_control_settings.apply(&mut device)?;
                 }
                 DataCommand::Write {
                     input,
@@ -212,17 +259,18 @@ fn main() -> Result<()> {
                     buffer_size,
                     verify,
                     verification_read_buffer_size,
+                    external_control_settings,
                 } => {
                     let buffer_size = match NonZeroU8::new(buffer_size) {
                         None => {
                             return Err(anyhow!("Illegal buffer size"));
-                        },
+                        }
                         Some(bsz) => bsz,
                     };
                     let verification_read_buffer_size = match NonZeroU8::new(verification_read_buffer_size) {
                         None => {
                             return Err(anyhow!("Illegal verification buffer size"));
-                        },
+                        }
                         Some(bsz) => bsz,
                     };
 
@@ -240,7 +288,7 @@ fn main() -> Result<()> {
                             data.len(),
                             offset,
                             device.memory_size()?,
-                        ))
+                        ));
                     }
 
                     write_data(&mut device, DataWriteRequest {
@@ -248,7 +296,7 @@ fn main() -> Result<()> {
                             data: data.as_slice(),
                             offset,
                         },
-                        buffer_size
+                        buffer_size,
                     })?;
 
                     if verify {
@@ -260,7 +308,7 @@ fn main() -> Result<()> {
                                 offset,
                                 size: NonZeroUsize::new(data.len()).unwrap(),
                                 buffer_size: verification_read_buffer_size,
-                            }
+                            },
                         )? {
                             let read_chunk = read_chunk?;
                             let chunk_offset = offset.wrapping_add(read_chunk.offset);
@@ -275,6 +323,8 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+
+                    external_control_settings.apply(&mut device)?;
                 }
             }
         }

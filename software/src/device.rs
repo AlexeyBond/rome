@@ -192,6 +192,18 @@ impl Device {
         Ok(())
     }
 
+    pub fn enable_external_control(&mut self) -> Result<()> {
+        self.send(b"E\n")?;
+
+        match self.receive(64)?.as_slice() {
+            b"EOK" => Ok(()),
+            x => Err(anyhow!(
+                "Unexpected response received: {}",
+                String::from_utf8_lossy(x),
+            ))
+        }
+    }
+
     pub fn memory_size(&mut self) -> Result<usize> {
         // TODO: Support devices with 32KiB (24257) memory (?)
         Ok(0x10000)
